@@ -42,6 +42,8 @@ See the paper for the full theoretical analysis and experimental results.
 
 ![RWKV-7 vs GDN FineWeb comparison](apps/LT2/scripts/rwkv7_native_gdn_fineweb_sp1024_share_card.png)
 
+Repository: <https://github.com/xiaol/LT2-RWKV>
+
 This fork adds two RWKV-7 paths:
 
 | `layer_pattern` | Meaning |
