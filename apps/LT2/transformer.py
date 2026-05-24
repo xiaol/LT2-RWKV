@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import math
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, List
 
@@ -390,7 +392,7 @@ def get_block_size(pattern: str, n_layers: int) -> int:
 
 
 _LINEAR_ATTN_TYPES = frozenset(
-    {"gdn", "retnet", "deltanet", "kda", "hgrn2", "mla", "mamba2", "nsa", "dsa", "cot_gdp"}
+    {"gdn", "retnet", "deltanet", "kda", "hgrn2", "mla", "mamba2", "nsa", "dsa", "cot_gdp", "rwkv7", "rwkv7_native"}
 )
 
 # Linear-attention types that need CoT (chain-of-thought) state threaded through
@@ -413,8 +415,10 @@ def parse_layer_pattern(pattern: str, n_layers: int) -> List[str]:
       - "mla"           : all layers are MultiheadLatentAttention (fla; needs flash-attn)
       - "mamba2"        : all layers are Mamba2 (fla.layers.mamba2; causal_conv1d optional for fast path)
       - "nsa"           : all layers are NativeSparseAttention (fla.layers.nsa; Triton NSA kernels)
+      - "rwkv7"         : all layers are RWKV-7 x070 recurrent mixer blocks
+      - "rwkv7_native"  : all layers are full RWKV-7 x070 blocks (time mix + channel mix)
       - "interleaved:N:M:TYPE1:TYPE2" : cycle of N TYPE1 layers then M TYPE2 layers
-        TYPE1/TYPE2 ∈ {gdn, retnet, deltanet, kda, hgrn2, mla, mamba2, nsa, full}.
+        TYPE1/TYPE2 ∈ {gdn, retnet, deltanet, kda, hgrn2, mla, mamba2, nsa, rwkv7, rwkv7_native, full}.
         Example: "interleaved:4:1:gdn:full" → 4 GDN then 1 full, repeated.
     """
     pattern = pattern.strip().lower()
@@ -441,11 +445,15 @@ def parse_layer_pattern(pattern: str, n_layers: int) -> List[str]:
         return ["dsa"] * n_layers
     if pattern == "cot_gdp":
         return ["cot_gdp"] * n_layers
+    if pattern == "rwkv7":
+        return ["rwkv7"] * n_layers
+    if pattern == "rwkv7_native":
+        return ["rwkv7_native"] * n_layers
 
     if not pattern.startswith("interleaved:"):
         raise ValueError(
             f"Unsupported layer_pattern: {pattern!r}. "
-            "Expected 'full', 'gdn', 'retnet', 'deltanet', 'kda', 'hgrn2', 'mla', 'mamba2', 'nsa', "
+            "Expected 'full', 'gdn', 'retnet', 'deltanet', 'kda', 'hgrn2', 'mla', 'mamba2', 'nsa', 'rwkv7', 'rwkv7_native', "
             "or 'interleaved:N:M:TYPE1:TYPE2'."
         )
 
@@ -462,7 +470,7 @@ def parse_layer_pattern(pattern: str, n_layers: int) -> List[str]:
         raise ValueError("N must be > 0 for interleaved pattern")
     if n_type2 < 0:
         raise ValueError("M must be >= 0 for interleaved pattern")
-    allowed = {"gdn", "retnet", "deltanet", "kda", "hgrn2", "mla", "mamba2", "nsa", "dsa", "cot_gdp", "full"}
+    allowed = {"gdn", "retnet", "deltanet", "kda", "hgrn2", "mla", "mamba2", "nsa", "dsa", "cot_gdp", "rwkv7", "rwkv7_native", "full"}
     if type1 not in allowed or type2 not in allowed:
         raise ValueError(f"layer types must be in {allowed}, got {type1!r}, {type2!r}")
     if type1 == type2 and n_type2 > 0:
@@ -735,6 +743,551 @@ class LinearAttentionBlock(nn.Module):
         self.attention_norm.reset_parameters()
         self.ffn_norm.reset_parameters()
         self.feed_forward.reset_parameters(init_std, factor)
+
+
+def _rwkv7_ortho_init(x: torch.Tensor, scale: float = 1.0):
+    with torch.no_grad():
+        shape = x.shape
+        if len(shape) == 2:
+            gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1.0
+            nn.init.orthogonal_(x, gain=gain * scale)
+        elif len(shape) == 3:
+            gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1.0
+            for i in range(shape[0]):
+                nn.init.orthogonal_(x[i], gain=gain * scale)
+        else:
+            raise ValueError(f"Unsupported tensor shape for RWKV-7 orthogonal init: {shape}")
+        return x
+
+
+def rwkv7_recurrence_torch(
+    r: torch.Tensor,
+    w: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    head_size: int,
+) -> torch.Tensor:
+    """Reference RWKV-7 recurrence in plain PyTorch.
+
+    This is intentionally slower than the fused CUDA kernel, but it is portable
+    and differentiable, which makes it useful for LT2 smoke tests and CPU runs.
+    """
+    B, T, C = r.shape
+    H = C // head_size
+    dtype = r.dtype
+    r = r.reshape(B, T, H, head_size)
+    k = k.reshape(B, T, H, head_size)
+    v = v.reshape(B, T, H, head_size)
+    a = a.reshape(B, T, H, head_size)
+    b = b.reshape(B, T, H, head_size)
+    decay = torch.exp(-torch.exp(w.float())).reshape(B, T, H, head_size)
+    state = torch.zeros(B, H, head_size, head_size, device=r.device, dtype=torch.float32)
+    out = []
+    for t in range(T):
+        rt = r[:, t].float()
+        kt = k[:, t].float()
+        vt = v[:, t].float()
+        at = a[:, t].float()
+        bt = b[:, t].float()
+        wt = decay[:, t]
+        sa = (state * at.unsqueeze(-2)).sum(dim=-1)
+        state = (
+            state * wt.unsqueeze(-2)
+            + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+            + sa.unsqueeze(-1) * bt.unsqueeze(-2)
+        )
+        out.append((state * rt.unsqueeze(-2)).sum(dim=-1).to(dtype))
+    return torch.stack(out, dim=1).reshape(B, T, C)
+
+
+def _rwkv7_time_shift_delta(x: torch.Tensor) -> torch.Tensor:
+    xx = torch.empty_like(x)
+    xx[:, 0] = -x[:, 0]
+    if x.size(1) > 1:
+        xx[:, 1:] = x[:, :-1] - x[:, 1:]
+    return xx
+
+
+def rwkv7_cross_entropy(logits: torch.Tensor, target: torch.Tensor, use_l2wrap_ce: bool = False):
+    if use_l2wrap_ce and logits.is_cuda and logits.dtype in {torch.bfloat16, torch.float32}:
+        try:
+            from apps.LT2 import rwkv7_cuda
+
+            return rwkv7_cuda.l2wrap_cross_entropy(logits, target)
+        except Exception as exc:
+            warnings.warn(
+                f"Falling back to standard cross entropy because RWKV-7 fused CE is unavailable: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return cross_entropy(logits, target)
+
+
+class RWKV7TimeMix(nn.Module):
+    """RWKV-7 x070 sequence mixer used as LT2's linear-attention replacement."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        layer_id: int,
+        head_size: int = 64,
+        enable_v_first_mix: bool = True,
+        backend: str = "auto",
+        chunk_len: int = 16,
+    ):
+        super().__init__()
+        if dim % head_size != 0:
+            raise ValueError(
+                f"RWKV-7 requires dim ({dim}) to be divisible by rwkv7_head_size ({head_size})"
+            )
+        if backend not in {"auto", "cuda", "torch"}:
+            raise ValueError(f"Unknown RWKV-7 backend: {backend}")
+        self.dim = dim
+        self.depth = depth
+        self.layer_id = layer_id
+        self.head_size = head_size
+        self.n_head = dim // head_size
+        self.enable_v_first_mix = enable_v_first_mix
+        self.backend = backend
+        self.chunk_len = chunk_len
+
+        decay_lora_dim = max(32, int(round((2.5 * (dim**0.5)) / 32) * 32))
+        aaa_lora_dim = max(32, int(round((2.5 * (dim**0.5)) / 32) * 32))
+        gate_lora_dim = max(32, int(round((5.0 * (dim**0.5)) / 32) * 32))
+        mv_lora_dim = max(32, int(round((1.7 * (dim**0.5)) / 32) * 32))
+
+        self.x_r = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.x_w = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.x_k = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.x_v = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.x_a = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.x_g = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+
+        self.w1 = nn.Parameter(torch.empty(dim, decay_lora_dim, dtype=torch.float32))
+        self.w2 = nn.Parameter(torch.empty(decay_lora_dim, dim, dtype=torch.float32))
+        self.w0 = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+
+        self.a1 = nn.Parameter(torch.empty(dim, aaa_lora_dim, dtype=torch.float32))
+        self.a2 = nn.Parameter(torch.empty(aaa_lora_dim, dim, dtype=torch.float32))
+        self.a0 = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+
+        if enable_v_first_mix:
+            self.v1 = nn.Parameter(torch.empty(dim, mv_lora_dim, dtype=torch.float32))
+            self.v2 = nn.Parameter(torch.empty(mv_lora_dim, dim, dtype=torch.float32))
+            self.v0 = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+
+        self.g1 = nn.Parameter(torch.empty(dim, gate_lora_dim, dtype=torch.float32))
+        self.g2 = nn.Parameter(torch.empty(gate_lora_dim, dim, dtype=torch.float32))
+        self.k_k = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.k_a = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.r_k = nn.Parameter(torch.empty(self.n_head, head_size, dtype=torch.float32))
+
+        self.receptance = nn.Linear(dim, dim, bias=False)
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        self.ln_x = nn.GroupNorm(self.n_head, dim, eps=64e-5)
+        if not self.x_r.is_meta:
+            self.reset_parameters()
+
+    def _init_vectors(self):
+        device = self.x_r.device
+        dim = self.dim
+        ratio_0_to_1 = self.layer_id / max(self.depth - 1, 1)
+        ratio_1_to_almost0 = 1.0 - (self.layer_id / max(self.depth, 1))
+        ddd = torch.arange(dim, device=device, dtype=torch.float32) / dim
+        linear = torch.arange(dim, device=device, dtype=torch.float32) / max(dim - 1, 1) - 0.5
+        zigzag = torch.arange(dim, device=device, dtype=torch.float32) % self.head_size
+        zigzag = (zigzag - ((self.head_size - 1) / 2)) / max((self.head_size - 1) / 2, 1.0)
+        zigzag = zigzag * zigzag.abs()
+        decay = -6 + 6 * (
+            torch.arange(dim, device=device, dtype=torch.float32) / max(dim - 1, 1)
+        ) ** (1 + ratio_0_to_1**0.3)
+
+        with torch.no_grad():
+            self.x_r.copy_(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.x_w.copy_(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+            self.x_k.copy_(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+            self.x_v.copy_(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+            self.x_a.copy_(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+            self.x_g.copy_(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.w0.copy_(decay + 0.5 + zigzag * 2.5)
+            self.a0.copy_(torch.zeros_like(linear) - 0.19 + zigzag * 0.3 + linear * 0.4)
+            if self.enable_v_first_mix:
+                self.v0.copy_(torch.zeros_like(linear) + 0.73 - linear * 0.4)
+            self.k_k.copy_(torch.zeros_like(linear) + 0.71 - linear * 0.1)
+            self.k_a.fill_(1.02)
+            self.r_k.fill_(-0.04)
+
+    def reset_parameters(self, init_std: Optional[float] = None):
+        init_std = init_std or (self.dim ** (-0.5))
+        self._init_vectors()
+        with torch.no_grad():
+            self.w1.zero_()
+            _rwkv7_ortho_init(self.w2, 0.1)
+            self.a1.zero_()
+            _rwkv7_ortho_init(self.a2, 0.1)
+            if self.enable_v_first_mix:
+                self.v1.zero_()
+                _rwkv7_ortho_init(self.v2, 0.1)
+            self.g1.zero_()
+            _rwkv7_ortho_init(self.g2, 0.1)
+        for proj in [self.receptance, self.key, self.value]:
+            nn.init.trunc_normal_(
+                proj.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+        nn.init.zeros_(self.output.weight)
+        self.ln_x.reset_parameters()
+
+    def _can_use_fast_bf16(self, x: torch.Tensor) -> bool:
+        return (
+            self.backend != "torch"
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.head_size == 64
+        )
+
+    def _forward_fast_bf16(
+        self,
+        x: torch.Tensor,
+        v_first: Optional[torch.Tensor] = None,
+        reset_v_first: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from apps.LT2 import rwkv7_cuda
+
+        B, T, C = x.size()
+        xr, xw, xk, xv, xa, xg = rwkv7_cuda.tmix_mix6(
+            x,
+            self.x_r.to(device=x.device, dtype=x.dtype),
+            self.x_w.to(device=x.device, dtype=x.dtype),
+            self.x_k.to(device=x.device, dtype=x.dtype),
+            self.x_v.to(device=x.device, dtype=x.dtype),
+            self.x_a.to(device=x.device, dtype=x.dtype),
+            self.x_g.to(device=x.device, dtype=x.dtype),
+        )
+
+        r = self.receptance(xr)
+        w = self.w0.to(dtype=x.dtype).view(1, 1, -1) + (
+            torch.tanh(xw @ self.w1.to(dtype=x.dtype)) @ self.w2.to(dtype=x.dtype)
+        )
+        k = self.key(xk)
+        v = self.value(xv)
+        if reset_v_first or v_first is None:
+            v_first = v
+        elif self.enable_v_first_mix:
+            v12 = (xv @ self.v1.to(dtype=x.dtype)) @ self.v2.to(dtype=x.dtype)
+            v = rwkv7_cuda.tmix_vres_gate(
+                v,
+                v_first,
+                self.v0.to(device=x.device, dtype=x.dtype),
+                v12,
+            )
+
+        a = rwkv7_cuda.tmix_a_gate(
+            self.a0.to(device=x.device, dtype=x.dtype),
+            (xa @ self.a1.to(dtype=x.dtype)) @ self.a2.to(dtype=x.dtype),
+        )
+        g = torch.sigmoid(xg @ self.g1.to(dtype=x.dtype)) @ self.g2.to(dtype=x.dtype)
+        k, neg_kk, kka = rwkv7_cuda.tmix_kk_pre(
+            k,
+            self.k_k.to(device=x.device, dtype=x.dtype),
+            a,
+            self.k_a.to(device=x.device, dtype=x.dtype),
+            self.head_size,
+        )
+        y = rwkv7_cuda.rwkv7_recurrence_cuda_bf16(
+            r,
+            w,
+            k,
+            v,
+            neg_kk,
+            kka,
+            self.head_size,
+            self.chunk_len,
+        )
+        y = rwkv7_cuda.tmix_lnx_rkvres_xg(
+            y,
+            r,
+            k,
+            v,
+            self.r_k.to(device=x.device, dtype=x.dtype),
+            self.ln_x.weight.to(device=x.device, dtype=x.dtype),
+            self.ln_x.bias.to(device=x.device, dtype=x.dtype),
+            g,
+        )
+        return self.output(y), v_first
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        v_first: Optional[torch.Tensor] = None,
+        reset_v_first: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._can_use_fast_bf16(x):
+            try:
+                return self._forward_fast_bf16(x, v_first, reset_v_first)
+            except Exception as exc:
+                if self.backend == "cuda":
+                    raise
+                warnings.warn(
+                    f"Falling back to pure PyTorch RWKV-7 backend because CUDA kernels are unavailable: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        B, T, C = x.size()
+        xx = _rwkv7_time_shift_delta(x)
+        xr = x + xx * self.x_r.to(dtype=x.dtype).view(1, 1, -1)
+        xw = x + xx * self.x_w.to(dtype=x.dtype).view(1, 1, -1)
+        xk = x + xx * self.x_k.to(dtype=x.dtype).view(1, 1, -1)
+        xv = x + xx * self.x_v.to(dtype=x.dtype).view(1, 1, -1)
+        xa = x + xx * self.x_a.to(dtype=x.dtype).view(1, 1, -1)
+        xg = x + xx * self.x_g.to(dtype=x.dtype).view(1, 1, -1)
+
+        r = self.receptance(xr)
+        w = self.w0.to(dtype=x.dtype).view(1, 1, -1) + (
+            torch.tanh(xw @ self.w1.to(dtype=x.dtype)) @ self.w2.to(dtype=x.dtype)
+        )
+        k = self.key(xk)
+        v = self.value(xv)
+        if reset_v_first or v_first is None:
+            v_first = v
+        elif self.enable_v_first_mix:
+            v_mix = torch.sigmoid(
+                self.v0.to(dtype=x.dtype).view(1, 1, -1)
+                + (xv @ self.v1.to(dtype=x.dtype)) @ self.v2.to(dtype=x.dtype)
+            )
+            v = v + (v_first - v) * v_mix
+
+        w = -F.softplus(-w.float()).to(dtype=x.dtype) - 0.5
+        a = torch.sigmoid(
+            self.a0.to(dtype=x.dtype).view(1, 1, -1)
+            + (xa @ self.a1.to(dtype=x.dtype)) @ self.a2.to(dtype=x.dtype)
+        )
+        g = torch.sigmoid(xg @ self.g1.to(dtype=x.dtype)) @ self.g2.to(dtype=x.dtype)
+
+        kk = k * self.k_k.to(dtype=x.dtype).view(1, 1, -1)
+        kk = F.normalize(kk.reshape(B, T, self.n_head, self.head_size), dim=-1, p=2.0).reshape(B, T, C)
+        k = k * (1 + (a - 1) * self.k_a.to(dtype=x.dtype).view(1, 1, -1))
+        y = rwkv7_recurrence_torch(r, w, k, v, -kk, kk * a, self.head_size)
+        y = self.ln_x(y.reshape(B * T, C)).reshape(B, T, C)
+        y = y + (
+            (
+                r.reshape(B, T, self.n_head, self.head_size)
+                * k.reshape(B, T, self.n_head, self.head_size)
+                * self.r_k.to(dtype=x.dtype)
+            )
+            .sum(dim=-1, keepdim=True)
+            * v.reshape(B, T, self.n_head, self.head_size)
+        ).reshape(B, T, C)
+        return self.output(y * g), v_first
+
+
+class RWKV7Block(nn.Module):
+    """LT2 block with RWKV-7 time mixing replacing the GDN/attention path."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        layer_id: int,
+        head_size: int,
+        ffn_dim_multiplier: Optional[float],
+        multiple_of: int,
+        norm_eps: float,
+        enable_v_first_mix: bool,
+        backend: str,
+        chunk_len: int,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.attention = RWKV7TimeMix(
+            dim=dim,
+            depth=depth,
+            layer_id=layer_id,
+            head_size=head_size,
+            enable_v_first_mix=enable_v_first_mix,
+            backend=backend,
+            chunk_len=chunk_len,
+        )
+        self.feed_forward = FeedForward(
+            dim=dim,
+            hidden_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+        )
+        self.attention_norm = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor = None,
+        tok_idx: torch.Tensor = None,
+        mask=None,
+        attn_impl: str = "flash_attn3",
+        v_first: Optional[torch.Tensor] = None,
+        reset_v_first: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_out, v_first = self.attention(
+            self.attention_norm(x),
+            v_first=v_first,
+            reset_v_first=reset_v_first,
+        )
+        h = x + attn_out
+        return h + self.feed_forward(self.ffn_norm(h)), v_first
+
+    def init_weights(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        self.attention.reset_parameters(init_std)
+        self.attention_norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.feed_forward.reset_parameters(init_std, factor)
+
+
+class RWKV7ChannelMix(nn.Module):
+    """Native RWKV-7 channel mix with optional bf16 CUDA kernel."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        layer_id: int,
+        ffn_dim: Optional[int],
+        backend: str,
+        multiple_of: int = 32,
+        ffn_dim_multiplier: Optional[float] = None,
+    ):
+        super().__init__()
+        if backend not in {"auto", "cuda", "torch"}:
+            raise ValueError(f"Unknown RWKV-7 backend: {backend}")
+        self.dim = dim
+        self.depth = depth
+        self.layer_id = layer_id
+        self.backend = backend
+        if ffn_dim is None:
+            ffn_dim = 4 * dim
+            if ffn_dim_multiplier is not None:
+                ffn_dim = int(ffn_dim_multiplier * ffn_dim)
+            ffn_dim = multiple_of * ((ffn_dim + multiple_of - 1) // multiple_of)
+        self.ffn_dim = ffn_dim
+        ratio_1_to_almost0 = 1.0 - (layer_id / max(depth, 1))
+        ddd = torch.arange(dim, dtype=torch.float32) / dim
+        self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+        self.key = nn.Linear(dim, self.ffn_dim, bias=False)
+        self.value = nn.Linear(self.ffn_dim, dim, bias=False)
+        if not self.x_k.is_meta:
+            self.reset_parameters()
+
+    def reset_parameters(self, init_std: Optional[float] = None, factor: float = 1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        nn.init.trunc_normal_(
+            self.key.weight,
+            mean=0.0,
+            std=init_std,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+        nn.init.zeros_(self.value.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.backend != "torch"
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.ffn_dim == self.dim * 4
+        ):
+            try:
+                from apps.LT2 import rwkv7_cuda
+
+                return rwkv7_cuda.cmix_layer(
+                    x,
+                    self.x_k.to(device=x.device, dtype=x.dtype),
+                    self.key.weight.to(dtype=x.dtype),
+                    self.value.weight.to(dtype=x.dtype),
+                )
+            except Exception as exc:
+                if self.backend == "cuda":
+                    raise
+                warnings.warn(
+                    f"Falling back to PyTorch RWKV-7 channel mix because CUDA kernel is unavailable: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        xx = _rwkv7_time_shift_delta(x)
+        k = x + xx * self.x_k.to(dtype=x.dtype).view(1, 1, -1)
+        return self.value(F.relu(self.key(k)).square())
+
+
+class RWKV7NativeBlock(nn.Module):
+    """Full native RWKV-7 block: time mix plus RWKV channel mix."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        layer_id: int,
+        head_size: int,
+        norm_eps: float,
+        ffn_dim_multiplier: Optional[float],
+        multiple_of: int,
+        enable_v_first_mix: bool,
+        backend: str,
+        chunk_len: int,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.attention = RWKV7TimeMix(
+            dim=dim,
+            depth=depth,
+            layer_id=layer_id,
+            head_size=head_size,
+            enable_v_first_mix=enable_v_first_mix,
+            backend=backend,
+            chunk_len=chunk_len,
+        )
+        self.channel_mix = RWKV7ChannelMix(
+            dim,
+            depth,
+            layer_id,
+            ffn_dim=None,
+            backend=backend,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+        )
+        self.attention_norm = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm = RMSNorm(dim, eps=norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor = None,
+        tok_idx: torch.Tensor = None,
+        mask=None,
+        attn_impl: str = "flash_attn3",
+        v_first: Optional[torch.Tensor] = None,
+        reset_v_first: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_out, v_first = self.attention(
+            self.attention_norm(x),
+            v_first=v_first,
+            reset_v_first=reset_v_first,
+        )
+        h = x + attn_out
+        return h + self.channel_mix(self.ffn_norm(h)), v_first
+
+    def init_weights(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        self.attention.reset_parameters(init_std)
+        self.channel_mix.reset_parameters(init_std, factor)
+        self.attention_norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
 
 
 class RetNetLinearAttentionBlock(nn.Module):
@@ -2147,8 +2700,10 @@ class LoopedWindowTransformerArgs(BaseTransformerArgs):
     # - "mamba2"      : all layers are Mamba2 (fla.layers.mamba2)
     # - "nsa"         : all layers are NativeSparseAttention (fla; NSA Triton)
     # - "dsa"         : all layers are DSA sparse MLA (TileLang kernel; see DSABlock)
+    # - "rwkv7"       : all layers are RWKV-7 x070 time-mix blocks (pure PyTorch recurrence)
+    # - "rwkv7_native": all layers are full RWKV-7 x070 blocks (time mix + channel mix)
     # - "interleaved:N:M:TYPE1:TYPE2" : cycle of N TYPE1 then M TYPE2 layers
-    #   TYPE1/TYPE2 ∈ {gdn, retnet, deltanet, kda, hgrn2, mla, mamba2, nsa, dsa, full}.
+    #   TYPE1/TYPE2 ∈ {gdn, retnet, deltanet, kda, hgrn2, mla, mamba2, nsa, dsa, rwkv7, rwkv7_native, full}.
     #   Example: "interleaved:4:1:dsa:full"
     # Linear-attention layers ignore the window mask from attention_pattern.
     # Full layers use flash_attn3 (or the configured attn_impl) with the window mask.
@@ -2213,6 +2768,15 @@ class LoopedWindowTransformerArgs(BaseTransformerArgs):
     dsa_block_i: int = 64        # Kernel tile size (must divide dsa_topk)
     dsa_score_dim: int = 64      # Per-head dim for the cheap scoring Q_s×K_s attention
     dsa_sm_scale: Optional[float] = None  # Softmax scale; None → 1/sqrt(576) * log2(e)
+
+    # RWKV-7 (layer_pattern "rwkv7") — x070 time-mix recurrence replacing GDN.
+    # Head size must divide dim. v_first mixing is threaded across effective
+    # loop depth, so later loop passes can reuse the first RWKV value stream.
+    rwkv7_head_size: int = 64
+    rwkv7_enable_v_first_mix: bool = True
+    rwkv7_backend: str = "auto"  # "auto", "cuda", or "torch"
+    rwkv7_chunk_len: int = 16
+    rwkv7_use_l2wrap_ce: bool = False
 
     # Gated attention: elementwise head-specific sigmoid gate after SDPA output (G1 in paper).
     # See "Gated Attention for Large Language Models" (Qiu et al., NeurIPS 2025).
@@ -2440,6 +3004,36 @@ class LoopedWindowTransformer(BaseTransformer):
                         layer_idx=layer_idx,
                     )
                 )
+            elif layer_type == "rwkv7":
+                self.layers.append(
+                    RWKV7Block(
+                        dim=args.dim,
+                        depth=max(args.n_layers * args.loop_count, 1),
+                        layer_id=layer_idx,
+                        head_size=args.rwkv7_head_size,
+                        ffn_dim_multiplier=args.ffn_dim_multiplier,
+                        multiple_of=args.multiple_of,
+                        norm_eps=args.norm_eps,
+                        enable_v_first_mix=args.rwkv7_enable_v_first_mix,
+                        backend=args.rwkv7_backend,
+                        chunk_len=args.rwkv7_chunk_len,
+                    )
+                )
+            elif layer_type == "rwkv7_native":
+                self.layers.append(
+                    RWKV7NativeBlock(
+                        dim=args.dim,
+                        depth=max(args.n_layers * args.loop_count, 1),
+                        layer_id=layer_idx,
+                        head_size=args.rwkv7_head_size,
+                        norm_eps=args.norm_eps,
+                        ffn_dim_multiplier=args.ffn_dim_multiplier,
+                        multiple_of=args.multiple_of,
+                        enable_v_first_mix=args.rwkv7_enable_v_first_mix,
+                        backend=args.rwkv7_backend,
+                        chunk_len=args.rwkv7_chunk_len,
+                    )
+                )
             else:
                 if args.use_attn_gate:
                     self.layers.append(GatedTransformerBlock(args))
@@ -2566,6 +3160,7 @@ class LoopedWindowTransformer(BaseTransformer):
         seqlen: int,
         kv_loop_idx: int,
         cot_cache: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        rwkv_v_first_cache: Optional[List[Optional[torch.Tensor]]] = None,
     ):
         layer = self.layers[layer_idx]
         layer_type = self.layer_types[layer_idx]
@@ -2576,6 +3171,16 @@ class LoopedWindowTransformer(BaseTransformer):
             h, vs = layer(h, current_cot_step=kv_loop_idx + 1, cached_v=cached_v)
             if cot_cache is not None:
                 cot_cache[layer_idx] = vs
+            return h
+        if layer_type in {"rwkv7", "rwkv7_native"}:
+            v_first = rwkv_v_first_cache[0] if rwkv_v_first_cache is not None else None
+            h, v_first = layer(
+                h,
+                v_first=v_first,
+                reset_v_first=v_first is None,
+            )
+            if rwkv_v_first_cache is not None:
+                rwkv_v_first_cache[0] = v_first
             return h
         if layer_type in _LINEAR_ATTN_TYPES:
             return layer(h)
@@ -2605,6 +3210,7 @@ class LoopedWindowTransformer(BaseTransformer):
         kv_loop_idx: int,
         layer_end_exclusive: int,
         cot_cache: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        rwkv_v_first_cache: Optional[List[Optional[torch.Tensor]]] = None,
     ):
         """Apply block-structured stack for layers in ``[0, layer_end_exclusive)``."""
         for block_idx in range(self.n_blocks):
@@ -2626,6 +3232,7 @@ class LoopedWindowTransformer(BaseTransformer):
                     seqlen,
                     kv_loop_idx,
                     cot_cache=cot_cache,
+                    rwkv_v_first_cache=rwkv_v_first_cache,
                 )
             if self.block_residual_weight is not None:
                 h = h + self.block_residual_weight[block_idx] * h_block_input
@@ -2640,6 +3247,9 @@ class LoopedWindowTransformer(BaseTransformer):
             [None] * len(self.layers)
             if any(lt in _COT_ATTN_TYPES for lt in self.layer_types)
             else None
+        )
+        rwkv_v_first_cache: Optional[List[Optional[torch.Tensor]]] = (
+            [None] if any(lt in {"rwkv7", "rwkv7_native"} for lt in self.layer_types) else None
         )
 
         # Legacy mode: weighted sum of hidden representations across iterations
@@ -2659,6 +3269,7 @@ class LoopedWindowTransformer(BaseTransformer):
                     loop_idx,
                     self._loop_prefix_end,
                     cot_cache=cot_cache,
+                    rwkv_v_first_cache=rwkv_v_first_cache,
                 )
                 if self.residual_weight is not None:
                     h = h + self.residual_weight[loop_idx] * h_input
@@ -2666,7 +3277,7 @@ class LoopedWindowTransformer(BaseTransformer):
                 h_accum = h_accum + self.iteration_weights[loop_idx] * h
 
             logits = self.output(self.norm(h_accum))
-            return cross_entropy(logits, target) if target is not None else logits
+            return rwkv7_cross_entropy(logits, target, self.args.rwkv7_use_l2wrap_ce) if target is not None else logits
 
         # Single final-CE mode: run all layers ``loop_count`` times, compute cross
         # entropy once on the final hidden state. Matches the reference CoTFormer
@@ -2685,12 +3296,13 @@ class LoopedWindowTransformer(BaseTransformer):
                 loop_idx,
                 self._loop_prefix_end,
                 cot_cache=cot_cache,
+                rwkv_v_first_cache=rwkv_v_first_cache,
             )
             if self.residual_weight is not None:
                 h = h + self.residual_weight[loop_idx] * h_input
 
         logits = self.output(self.norm(h))
-        return cross_entropy(logits, target) if target is not None else logits
+        return rwkv7_cross_entropy(logits, target, self.args.rwkv7_use_l2wrap_ce) if target is not None else logits
 
     def forward(
         self,
