@@ -1,0 +1,91 @@
+1
+00:00:00,000 --> 00:00:07,538
+A: What if a looped Transformer used RWKV-7 as its recurrent mixer, instead of GDN?
+
+2
+00:00:07,538 --> 00:00:14,000
+B: That sounds like a small code change with a big architectural question.
+
+3
+00:00:14,000 --> 00:00:21,304
+A: First, the relation. A Universal Transformer reuses the same transition block across depth steps.
+
+4
+00:00:21,304 --> 00:00:28,087
+B: So a looped Transformer is the language-model version of that same recurrence idea?
+
+5
+00:00:28,087 --> 00:00:33,043
+A: Exactly. It repeatedly applies a shared Transformer block.
+
+6
+00:00:33,043 --> 00:00:38,000
+LT2 asks what efficient token mixer should live inside that loop.
+
+7
+00:00:38,000 --> 00:00:44,263
+A: Each loop pass adds effective computation without adding a new copy of the parameters.
+
+8
+00:00:44,263 --> 00:00:49,184
+B: The shared block sees the updated hidden state again and again.
+
+9
+00:00:49,184 --> 00:00:55,000
+A: Right. The attraction is more recurrent refinement at nearly the same model size.
+
+10
+00:00:55,000 --> 00:01:03,140
+A: The LT2 baseline uses GDN, a DPLR-style recurrent mixer.
+
+11
+00:01:03,140 --> 00:01:11,279
+I added a full RWKV-7 native block, with time mix and channel mix, as its replacement.
+
+12
+00:01:11,279 --> 00:01:17,140
+B: Same looping idea, but a more expressive recurrent core.
+
+13
+00:01:17,140 --> 00:01:23,000
+A: In the repo, the switch is `layer_pattern = "rwkv7_native"`.
+
+14
+00:01:23,000 --> 00:01:30,043
+A: Then I ran a parameter-matched real-token test on FineWeb sp ten twenty-four.
+
+15
+00:01:30,043 --> 00:01:32,391
+B: Nearly the same parameters?
+
+16
+00:01:32,391 --> 00:01:40,609
+A: Yes. GDN has nine hundred sixty-two thousand parameters; RWKV-7 has nine hundred fifty-nine thousand.
+
+17
+00:01:40,609 --> 00:01:50,000
+B: And RWKV-7 reached about one point five seven times the throughput, with lower final validation loss.
+
+18
+00:01:50,000 --> 00:01:54,561
+A: Look at the smoothed training curve.
+
+19
+00:01:54,561 --> 00:01:59,122
+In this five-thousand-step ablation, RWKV-7 drops faster and stays below GDN.
+
+20
+00:01:59,122 --> 00:02:05,561
+B: It is still an early small-scale run, not the final pretraining verdict.
+
+21
+00:02:05,561 --> 00:02:12,000
+A: Correct. But it is a strong reason to run the full comparison.
+
+22
+00:02:12,000 --> 00:02:22,960
+A: The hypothesis is simple: looping already benefits recurrent mixers, and RWKV-7 may be a better recurrent core for LT2.
+
+23
+00:02:22,960 --> 00:02:33,920
+B: Give RWKV-7 a try. The code and curve are at github dot com slash xiaol slash LT2 dash RWKV.

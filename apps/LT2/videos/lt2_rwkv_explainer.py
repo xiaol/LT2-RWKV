@@ -63,6 +63,7 @@ class LT2RWKVExplainer(Scene):
     def construct(self):
         self.camera.background_color = BLACK
         self.opening()
+        self.universal_relation()
         self.looped_transformer()
         self.replacement()
         self.benchmark()
@@ -95,8 +96,34 @@ class LT2RWKVExplainer(Scene):
 
         self.play(Write(title), run_time=1.0)
         self.play(FadeIn(subtitle, shift=0.25 * DOWN), FadeIn(repo, shift=0.25 * DOWN), run_time=1.0)
-        self.wait(1.5)
+        self.wait(10.3)
         self.play(FadeOut(VGroup(title, subtitle, repo), shift=0.25 * UP), run_time=0.7)
+
+    def universal_relation(self):
+        title = self.fit_width(Text("Universal Transformer -> Looped Transformer", font=FONT, weight=BOLD, color=INK, font_size=40))
+        title.to_edge(UP, buff=0.35)
+
+        ut_title = Text("Universal Transformer", font=FONT, weight=BOLD, color=PURPLE, font_size=31)
+        lt_title = Text("Looped Transformer", font=FONT, weight=BOLD, color=RWKV, font_size=31)
+        ut = self.reuse_panel("shared transition", "same parameters across depth", PURPLE)
+        lt = self.reuse_panel("shared Transformer block", "same language-model block loops", RWKV)
+        ut_col = VGroup(ut_title, ut).arrange(DOWN, buff=0.24)
+        lt_col = VGroup(lt_title, lt).arrange(DOWN, buff=0.24)
+        cols = VGroup(ut_col, lt_col).arrange(RIGHT, buff=0.9)
+        self.fit_width(cols, max_width=13.0)
+        cols.shift(UP * 0.2)
+
+        bridge = Arrow(ut.get_right(), lt.get_left(), buff=0.32, color=ACCENT, stroke_width=5)
+        bridge_label = Text("same idea", font=FONT, color=ACCENT, font_size=20).next_to(bridge, DOWN, buff=0.18)
+
+        bottom = self.code_panel("LT2 asks: what mixer should live inside the loop?").to_edge(DOWN, buff=0.62)
+
+        self.play(Write(title), run_time=0.9)
+        self.play(FadeIn(ut_col, shift=0.25 * RIGHT), run_time=1.0)
+        self.play(GrowArrow(bridge), FadeIn(bridge_label), FadeIn(lt_col, shift=0.25 * LEFT), run_time=1.2)
+        self.play(FadeIn(bottom, shift=0.18 * UP), Circumscribe(bottom, color=ACCENT), run_time=1.2)
+        self.wait(17.0)
+        self.play(FadeOut(VGroup(title, cols, bridge, bridge_label, bottom)), run_time=0.7)
 
     def looped_transformer(self):
         title = self.fit_width(Text("Looping turns one block into many effective steps", font=FONT, weight=BOLD, color=INK, font_size=40))
@@ -130,7 +157,7 @@ class LT2RWKVExplainer(Scene):
         self.play(GrowArrow(arrow1), GrowArrow(arrow2), FadeIn(out, shift=0.2 * RIGHT), run_time=0.8)
         self.play(Create(loop_arrow), FadeIn(passes, lag_ratio=0.18), run_time=1.2)
         self.play(FadeIn(note, shift=0.2 * UP), run_time=0.7)
-        self.wait(1.5)
+        self.wait(10.8)
         self.play(FadeOut(VGroup(title, tokens, block, out, arrow1, arrow2, passes, loop_arrow, note)), run_time=0.7)
 
     def replacement(self):
@@ -150,7 +177,7 @@ class LT2RWKVExplainer(Scene):
         self.play(FadeIn(gdn, shift=0.3 * RIGHT), run_time=0.9)
         self.play(GrowArrow(arrow), FadeIn(label), ReplacementTransform(gdn.copy(), rwkv), run_time=1.2)
         self.play(FadeIn(code, shift=0.25 * UP), Circumscribe(code, color=RWKV), run_time=1.2)
-        self.wait(1.6)
+        self.wait(21.2)
         self.play(FadeOut(VGroup(title, gdn, rwkv, arrow, label, code)), run_time=0.7)
 
     def benchmark(self):
@@ -179,7 +206,7 @@ class LT2RWKVExplainer(Scene):
         self.play(FadeIn(left, shift=0.25 * RIGHT), FadeIn(right, shift=0.25 * LEFT), run_time=1.0)
         self.play(Create(chart), FadeIn(chart_title), run_time=1.0)
         self.play(FadeIn(takeaway, shift=0.2 * UP), Circumscribe(right, color=RWKV), run_time=1.2)
-        self.wait(1.8)
+        self.wait(20.3)
         self.play(FadeOut(VGroup(title, left, right, chart, chart_title, takeaway)), run_time=0.7)
 
     def loss_curve(self):
@@ -198,22 +225,15 @@ class LT2RWKVExplainer(Scene):
         self.play(Write(title), run_time=0.8)
         self.play(FadeIn(curve, shift=0.25 * UP), run_time=1.0)
         self.play(FadeIn(caption, shift=0.15 * UP), run_time=0.7)
-        self.wait(2.4)
+        self.wait(16.8)
         self.play(FadeOut(Group(title, curve, caption)), run_time=0.7)
 
     def repo_card(self):
         card = ImageMobject(str(SHARE_CARD))
-        card.set_width(13.0)
-        card.move_to(UP * 0.05)
-        footer = Text(
-            "github.com/xiaol/LT2-RWKV",
-            font=MONO,
-            color=RWKV,
-            font_size=30,
-        ).to_edge(DOWN, buff=0.35)
+        card.set_height(8.15)
+        card.move_to(UP * 0.02)
         self.play(FadeIn(card, shift=0.25 * UP), run_time=1.0)
-        self.play(FadeIn(footer, shift=0.18 * UP), run_time=0.8)
-        self.wait(2.0)
+        self.wait(31.0)
 
     def token_row(self):
         group = VGroup()
@@ -232,6 +252,8 @@ class LT2RWKVExplainer(Scene):
     def block(self, label, color, width=2.4):
         box = RoundedRectangle(width=width, height=1.25, corner_radius=0.16, color=color, fill_color=PANEL, fill_opacity=0.96, stroke_width=4)
         text = Text(label, font=FONT, color=INK, font_size=25).move_to(box)
+        if text.width > width - 0.3:
+            text.scale((width - 0.3) / text.width)
         return VGroup(box, text)
 
     def mixer_panel(self, title, subtitle, color):
@@ -260,6 +282,27 @@ class LT2RWKVExplainer(Scene):
         ).arrange(DOWN, buff=0.18)
         lines.move_to(box)
         return VGroup(box, lines)
+
+    def reuse_panel(self, block_label, note, color):
+        tokens = self.token_row()
+        block = self.block(block_label, color, width=3.25)
+        block.next_to(tokens, RIGHT, buff=0.45)
+        state = self.state_box("state", ACCENT).next_to(block, RIGHT, buff=0.45)
+        arrow1 = Arrow(tokens.get_right(), block.get_left(), buff=0.1, color=INK)
+        arrow2 = Arrow(block.get_right(), state.get_left(), buff=0.1, color=INK)
+        loop = Arrow(
+            block.get_bottom() + DOWN * 0.2 + RIGHT * 1.1,
+            block.get_bottom() + DOWN * 0.2 + LEFT * 1.1,
+            path_arc=-2.65,
+            color=color,
+            stroke_width=4,
+            buff=0.05,
+        )
+        passes = Text("repeat depth steps", font=MONO, color=ACCENT, font_size=19).next_to(loop, DOWN, buff=0.08)
+        note_mob = Text(note, font=FONT, color=MUTED, font_size=21).next_to(block, UP, buff=0.25)
+        panel = VGroup(tokens, block, state, arrow1, arrow2, loop, passes, note_mob)
+        panel.scale(0.76)
+        return panel
 
     def fit_width(self, mob, max_width: float = 14.2):
         if mob.width > max_width:

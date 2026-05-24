@@ -29,6 +29,11 @@ where `Mixer` may be any linear-attention, sparse-attention, or hybrid primitive
 reuses the same parameters `T` times in succession, so a block of `n_layers` attains an
 effective depth of `n_layers × T`.
 
+Conceptually, this is close to the **Universal Transformer** idea: reuse one transition
+function across depth steps and refine the hidden state repeatedly. A Looped Transformer
+specializes that recurrence to language-model Transformer blocks; LT2 then asks which
+efficient mixer should live inside the shared loop.
+
 - **LT2-linear** — DPLR linear-attention mixers (GDN, KDA, Mamba2, HGRN2, DeltaNet, RetNet). Loop iterations turn rank-1 state updates into rank-`T` updates.
 - **LT2-RWKV** — replaces the GDN-style recurrent mixer with RWKV-7. This fork supports both `rwkv7` as a mixer-only replacement and `rwkv7_native` as a full RWKV-7 time-mix + channel-mix block.
 - **LT2-sparse** — sliding-window, NSA, or DSA attention. A per-loop window of size `w` becomes an effective receptive field of `T·w`.
@@ -44,7 +49,9 @@ See the paper for the full theoretical analysis and experimental results.
 
 Repository: <https://github.com/xiaol/LT2-RWKV>
 
-Short explainer video: [LT2RWKVExplainer.mp4](apps/LT2/videos/media/videos/lt2_rwkv_explainer/1080p29.97/LT2RWKVExplainer.mp4)
+Narrated explainer video: [LT2RWKVExplainer_minimax.mp4](apps/LT2/videos/outputs/LT2RWKVExplainer_minimax.mp4)
+
+Silent Manim render: [LT2RWKVExplainer.mp4](apps/LT2/videos/media/videos/lt2_rwkv_explainer/1080p29.97/LT2RWKVExplainer.mp4)
 
 This fork adds two RWKV-7 paths:
 

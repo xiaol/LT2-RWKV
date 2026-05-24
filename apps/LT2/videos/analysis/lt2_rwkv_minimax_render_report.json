@@ -1,0 +1,93 @@
+{
+  "title": "LT2-RWKV short explainer",
+  "tts": {
+    "provider": "MiniMax",
+    "model": "speech-2.8-hd",
+    "voice_a": "English_captivating_female1",
+    "voice_b": "English_CaptivatingStoryteller",
+    "speed": 1.0,
+    "pitch": 0,
+    "volume": 1.0,
+    "normalization": "ffmpeg loudnorm=I=-20:TP=-1.5:LRA=11 per turn, per segment, and final mix"
+  },
+  "max_speed_factor": 1.0,
+  "audio_duration": 153.871021,
+  "video": "/home/xiaol/X/LT2_upstream/apps/LT2/videos/outputs/LT2RWKVExplainer_minimax.mp4",
+  "silent_video": "/home/xiaol/X/LT2_upstream/apps/LT2/videos/media/videos/lt2_rwkv_explainer/1080p29.97/LT2RWKVExplainer.mp4",
+  "wav": "/home/xiaol/X/LT2_upstream/apps/LT2/videos/narration/audio/lt2_rwkv_minimax/lt2_rwkv_minimax.wav",
+  "mp3": "/home/xiaol/X/LT2_upstream/apps/LT2/videos/narration/audio/lt2_rwkv_minimax/lt2_rwkv_minimax.mp3",
+  "srt": "/home/xiaol/X/LT2_upstream/apps/LT2/videos/narration/lt2_rwkv_minimax.srt",
+  "streams": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "index": 0,
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 1920,
+        "height": 1080,
+        "r_frame_rate": "30000/1001"
+      },
+      {
+        "index": 1,
+        "codec_name": "aac",
+        "codec_type": "audio",
+        "r_frame_rate": "0/0"
+      },
+      {
+        "index": 2,
+        "codec_name": "mov_text",
+        "codec_type": "subtitle",
+        "r_frame_rate": "0/0"
+      }
+    ],
+    "format": {
+      "duration": "153.871000"
+    }
+  },
+  "segment_reports": [
+    {
+      "segment": 1,
+      "raw_duration": 12.109271,
+      "target_duration": 14.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 2,
+      "raw_duration": 21.304354,
+      "target_duration": 24.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 3,
+      "raw_duration": 15.394896,
+      "target_duration": 17.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 4,
+      "raw_duration": 24.810583,
+      "target_duration": 28.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 5,
+      "raw_duration": 23.707604,
+      "target_duration": 27.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 6,
+      "raw_duration": 18.413458,
+      "target_duration": 22.0,
+      "speed_factor": 1.0
+    },
+    {
+      "segment": 7,
+      "raw_duration": 20.390854,
+      "target_duration": 21.920000000000016,
+      "speed_factor": 1.0
+    }
+  ]
+}
