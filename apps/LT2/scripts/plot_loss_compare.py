@@ -7,11 +7,28 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+def moving_average(values, window: int):
+    if window <= 1:
+        return values
+    smoothed = []
+    total = 0.0
+    queue = []
+    for value in values:
+        queue.append(float(value))
+        total += float(value)
+        if len(queue) > window:
+            total -= queue.pop(0)
+        smoothed.append(total / len(queue))
+    return smoothed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot mixer loss curves from comparison JSON.")
     parser.add_argument("--json", required=True, help="Path to comparison JSON.")
     parser.add_argument("--out-prefix", required=True, help="Output path prefix without extension.")
     parser.add_argument("--title", default="LT2 Mixer Loss Comparison")
+    parser.add_argument("--smooth-window", type=int, default=1, help="Trailing moving-average window.")
+    parser.add_argument("--show-raw", action="store_true", help="Show faint raw losses behind smoothed curves.")
     args = parser.parse_args()
 
     with open(args.json) as f:
@@ -28,23 +45,35 @@ def main() -> None:
     for result in data["results"]:
         losses = result["losses"]
         steps = list(range(1, len(losses) + 1))
+        plotted_losses = moving_average(losses, args.smooth_window)
         label = (
             f"{result['mixer']} "
             f"({result['params']:,} params, {result['tokens_per_second']:.0f} tok/s)"
         )
+        color = colors.get(result["mixer"])
+        if args.show_raw and args.smooth_window > 1:
+            ax.plot(
+                steps,
+                losses,
+                linewidth=0.7,
+                alpha=0.16,
+                color=color,
+            )
         ax.plot(
             steps,
-            losses,
-            marker="o",
-            linewidth=2.0,
-            markersize=3.8,
+            plotted_losses,
+            linewidth=2.4,
             label=label,
-            color=colors.get(result["mixer"]),
+            color=color,
         )
 
     ax.set_title(args.title, fontsize=14, pad=12)
-    ax.set_xlabel("Timed training step")
-    ax.set_ylabel("Cross entropy loss")
+    xlabel = "Timed training step"
+    ylabel = "Cross entropy loss"
+    if args.smooth_window > 1:
+        ylabel += f" ({args.smooth_window}-step moving average)"
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.legend(frameon=True, fontsize=9)
     ax.margins(x=0.02)
     fig.tight_layout()

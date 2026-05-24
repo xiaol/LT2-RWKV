@@ -40,6 +40,8 @@ See the paper for the full theoretical analysis and experimental results.
 
 ## 2. RWKV-7 Results
 
+![RWKV-7 vs GDN FineWeb comparison](apps/LT2/scripts/rwkv7_native_gdn_fineweb_sp1024_share_card.png)
+
 This fork adds two RWKV-7 paths:
 
 | `layer_pattern` | Meaning |
@@ -88,7 +90,8 @@ Plot the loss curve:
 python apps/LT2/scripts/plot_loss_compare.py \
   --json apps/LT2/rwkv7_native_gdn_fineweb_sp1024_param_matched_compare_5000.json \
   --out-prefix apps/LT2/scripts/rwkv7_native_gdn_fineweb_sp1024_param_matched_loss_curve_5000 \
-  --title "Full RWKV-7 Native vs GDN (FineWeb sp1024, 5000 steps)"
+  --title "Full RWKV-7 Native vs GDN (FineWeb sp1024, 5000 steps)" \
+  --smooth-window 100 --show-raw
 ```
 
 ---
