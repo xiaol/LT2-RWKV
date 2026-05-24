@@ -44,6 +44,8 @@ See the paper for the full theoretical analysis and experimental results.
 
 Repository: <https://github.com/xiaol/LT2-RWKV>
 
+Short explainer video: [LT2RWKVExplainer.mp4](apps/LT2/videos/media/videos/lt2_rwkv_explainer/1080p29.97/LT2RWKVExplainer.mp4)
+
 This fork adds two RWKV-7 paths:
 
 | `layer_pattern` | Meaning |
