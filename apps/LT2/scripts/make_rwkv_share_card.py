@@ -54,7 +54,10 @@ def main() -> None:
         "I trained a GDN vs. RWKV-7 comparison in Codex with one command: "
         "\"Give RWKV-7 a try.\" Here is what I got."
     )
-    caption = "FineWeb sp1024, parameter-matched tiny LT2 run, bf16 CUDA, 5000 steps"
+    caption = (
+        "FineWeb sp1024, parameter-matched tiny LT2 run, bf16 CUDA, 5000 steps\n"
+        "Repo: https://github.com/xiaol/LT2-RWKV"
+    )
 
     headline_lines = wrap_text(draw, headline, font_bold, text_width)
     body_lines = wrap_text(draw, body, font_body, text_width)
